@@ -1,112 +1,84 @@
 package main
 
 import (
-	"fmt"
 	"log"
-	"strings"
+	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-	gubrak "github.com/novalagung/gubrak/v2"
 )
 
-type SocketPayload struct {
-	Message string
+// Message represents a chat message.
+type Message struct {
+	Username string `json:"username"`
+	Room     string `json:"room"`
+	Text     string `json:"text"`
 }
 
-type SocketResponse struct {
-	From    string
-	Type    string
-	Message string
-}
-
-type WebSocketConnection struct {
-	*websocket.Conn
+// Client represents a connected user.
+type Client struct {
 	Username string
+	Room     string
+	Conn     *websocket.Conn
 }
 
 var (
-	upgrader = websocket.Upgrader{}
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool {
+			return true
+		},
+	}
+	clients   = make(map[*websocket.Conn]Client)
+	clientsMu sync.Mutex
 )
 
-type M map[string]interface{}
-
-const MESSAGE_NEW_USER = "New User"
-const MESSAGE_CHAT = "Chat"
-const MESSAGE_LEAVE = "Leave"
-
-var connections = make([]*WebSocketConnection, 0)
-
 func wsHandler(c echo.Context) error {
-	currentGorillaConn, err := upgrader.Upgrade(c.Response(), c.Request(), c.Response().Header())
+	conn, err := upgrader.Upgrade(c.Response(), c.Request(), c.Response().Header())
 
 	if err != nil {
 		return err
 	}
 
 	username := c.QueryParam("username")
+	room := c.QueryParam("room")
 
-	currentConn := WebSocketConnection{
-		Conn:     currentGorillaConn,
+	client := Client{
 		Username: username,
+		Room:     room,
+		Conn:     conn,
 	}
 
-	log.Println("username: ", username)
+	clientsMu.Lock()
+	clients[conn] = client
+	clientsMu.Unlock()
 
-	connections = append(connections, &currentConn)
-
-	go handleIO(&currentConn, connections)
-
-	return nil
-}
-
-func handleIO(currentConn *WebSocketConnection, connections []*WebSocketConnection) {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Println("ERROR", fmt.Sprintf("%v", r))
-		}
-	}()
-
-	broadcastMessage(currentConn, MESSAGE_NEW_USER, "")
+	log.Printf("User %s joined room %s", username, room)
 
 	for {
-		payload := SocketPayload{}
-		err := currentConn.ReadJSON(&payload)
+		var msg Message
+		err := conn.ReadJSON(&msg)
 		if err != nil {
-			if strings.Contains(err.Error(), "websocket: close") {
-				broadcastMessage(currentConn, MESSAGE_LEAVE, "")
-				ejectConnection(currentConn)
-				return
+			log.Printf("Error reading message: %v", err)
+			break
+		}
+
+		// Broadcast the message to all clients in the same room
+		clientsMu.Lock()
+		for _, c := range clients {
+			if c.Room == msg.Room {
+				err := c.Conn.WriteJSON(msg)
+				if err != nil {
+					log.Printf("Error writing message: %v", err)
+					break
+				}
 			}
-
-			log.Println("ERROR", err.Error())
-			continue
 		}
-
-		broadcastMessage(currentConn, MESSAGE_CHAT, payload.Message)
+		clientsMu.Unlock()
 	}
-}
 
-func ejectConnection(currentConn *WebSocketConnection) {
-	filtered := gubrak.From(connections).Reject(func(each *WebSocketConnection) bool {
-		return each == currentConn
-	}).Result()
-	connections = filtered.([]*WebSocketConnection)
-}
-
-func broadcastMessage(currentConn *WebSocketConnection, kind, message string) {
-	for _, eachConn := range connections {
-		if eachConn == currentConn {
-			continue
-		}
-
-		eachConn.WriteJSON(SocketResponse{
-			From:    currentConn.Username,
-			Type:    kind,
-			Message: message,
-		})
-	}
+	return nil
 }
 
 func main() {
